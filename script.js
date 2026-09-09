@@ -59,6 +59,26 @@ const FACEBOOK_PAGE_URL = "https://www.facebook.com/people/Kyidsa-Primary-School
 const SCHOOL_LOCATION_QUERY = "Kyidsa Primary School, Norbugang Gewog, Samtse Dzongkhag, Bhutan"; // used for the footer map — replace with exact coordinates (e.g. "27.xxxx,88.xxxx") if the name search isn't accurate enough
 const SCHOOL_INVENTORY_URL = "https://docs.google.com/spreadsheets/d/1j2vFFfvJw4yw3MFr8E1Qv3nwX_ngA2ZCRDN2jaP_Nds/edit?gid=0#gid=0"; // e.g. "https://docs.google.com/spreadsheets/d/xxxxx/edit"
 
+// Your Inventory spreadsheet's tabs — every one listed here shows up as a button
+// at the top of the Inventory page so teachers (and you) can switch between them.
+//   "label" — whatever you want shown on the button (can be anything, e.g. nicer wording)
+//   "sheet" — the tab's EXACT name as it appears on the tab at the bottom of the
+//             spreadsheet (case and spelling must match exactly). No need to hunt
+//             for a "gid" number — the app looks the tab up by name.
+// Filled in below from your actual spreadsheet ("Kyidsa PS e-Inventory") — add,
+// remove, rename, or reorder rows any time to match what's actually in the sheet.
+const INVENTORY_SHEETS = [
+  { label: "Structure", sheet: "Structure" },
+  { label: "Office Equipment", sheet: "Office equipment" },
+  { label: "Furniture", sheet: "Furniture" },
+  { label: "Library", sheet: "Library" },
+  { label: "Store", sheet: "Store" },
+  { label: "Science Equipment & Chemicals", sheet: "Science Equipment & Chemicals" },
+  { label: "Games and Sports", sheet: "Games and Sports" },
+  { label: "Kitchen Utensils", sheet: "Kitchen Untensils" },
+  { label: "Sheet9", sheet: "Sheet9" },
+];
+
 function emptyData() {
   return {
     teachers: [],
@@ -103,6 +123,9 @@ const state = {
   audioMuted: false,
   directorySearch: "",
   staffProfileTarget: null, // { kind: "teacher"|"staff", id }
+  inventoryState: {}, // { [gid]: { data: {cols,rows}|null, loading: bool, error: string } } — cached per sheet tab
+  inventoryActiveSheet: null, // which tab is currently showing on the Inventory page (by sheet name)
+  inventorySearch: "",
 };
 
 // ---------- Decorative page-wide twinkling stars (injected once, lives outside #app so re-renders don't touch it) ----------
@@ -1469,6 +1492,84 @@ function requestAdminMode() {
   }
 }
 
+// ---------- Read-only Inventory (Google Sheet, multiple tabs) ----------
+// Everyone (teachers and Principal alike) gets to VIEW the inventory, tab by tab,
+// straight from Google's public "gviz" query endpoint — no separate backend call
+// needed, and tabs are looked up by NAME (see INVENTORY_SHEETS above), so there's
+// no "gid" number to hunt for. This only works if the Sheet's sharing is set to
+// "Anyone with the link". Actually adding/editing items happens directly in
+// Google Sheets (via the "Add / Edit Items" button) — this view never writes
+// back to the sheet itself.
+function inventorySheetId() {
+  const idMatch = SCHOOL_INVENTORY_URL.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  return idMatch ? idMatch[1] : null;
+}
+
+function inventoryEditUrl() {
+  const id = inventorySheetId();
+  if (!id) return SCHOOL_INVENTORY_URL;
+  return `https://docs.google.com/spreadsheets/d/${id}/edit`;
+}
+
+async function fetchInventoryData(sheetName) {
+  const id = inventorySheetId();
+  if (!id) return { error: "The inventory sheet link isn't set up yet. Ask your Admin/Principal to paste it into SCHOOL_INVENTORY_URL." };
+  const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      return { error: `Could not load this sheet (server said ${res.status}). Make sure it's shared as "Anyone with the link".` };
+    }
+    const text = await res.text();
+    // The gviz endpoint wraps its JSON in a JS function call — pull out just the object.
+    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]*)\);?\s*$/);
+    if (!match) {
+      return { error: 'Could not read this sheet. Make sure it is shared as "Anyone with the link" (not "Restricted"), and that the tab still exists.' };
+    }
+    let json;
+    try {
+      json = JSON.parse(match[1]);
+    } catch (e) {
+      return { error: "Could not understand this sheet's data." };
+    }
+    if (!json.table) return { error: "Could not read this sheet's data." };
+    const cols = (json.table.cols || []).map((c) => (c && (c.label || c.id)) || "");
+    const rows = (json.table.rows || []).map((r) =>
+      (r.c || []).map((cell) => {
+        if (!cell) return "";
+        const val = cell.f !== undefined && cell.f !== null ? cell.f : cell.v;
+        return val === null || val === undefined ? "" : String(val);
+      })
+    );
+    return { cols, rows };
+  } catch (err) {
+    return { error: "Could not reach the inventory sheet: " + err.message };
+  }
+}
+
+function getInventoryTabState(sheetName) {
+  if (!state.inventoryState[sheetName]) state.inventoryState[sheetName] = { data: null, loading: false, error: "" };
+  return state.inventoryState[sheetName];
+}
+
+async function loadInventoryData(sheetName, force) {
+  const tab = getInventoryTabState(sheetName);
+  if (tab.data && !force) return;
+  tab.loading = true;
+  tab.error = "";
+  render();
+  const res = await fetchInventoryData(sheetName);
+  tab.loading = false;
+  if (res.error) {
+    tab.error = res.error;
+    tab.data = null;
+  } else {
+    tab.data = { cols: res.cols, rows: res.rows };
+    tab.error = "";
+  }
+  render();
+}
+
 // ---------- Rendering ----------
 function render() {
   const app = document.getElementById("app");
@@ -1485,6 +1586,7 @@ function render() {
   if (state.view === "dashboard" && !state.adminMode) state.view = "home";
   if (state.view === "folder" && !activeTeacher) { state.view = "home"; state.activeTeacherId = null; }
   if (state.view === "todReports" && !state.session && !state.adminMode) state.view = "home";
+  if (state.view === "inventory" && !state.session && !state.adminMode) state.view = "home";
 
   saveNavState();
 
@@ -1529,6 +1631,7 @@ function render() {
       ${state.view === "dashboard" && state.adminMode ? renderDashboard() : ""}
       ${state.view === "folder" && activeTeacher ? renderFolder(activeTeacher) : ""}
       ${state.view === "todReports" ? renderTodReportsPage() : ""}
+      ${state.view === "inventory" ? renderInventoryPage() : ""}
       ${state.view === "studentDetails" ? renderStudentDetails() : ""}
       ${state.view === "staffDirectory" ? renderStaffDirectory() : ""}
       ${state.view === "staffProfile" ? renderStaffProfilePage() : ""}
@@ -1550,15 +1653,12 @@ function render() {
 }
 
 function renderTabs() {
-  const inventoryReady = SCHOOL_INVENTORY_URL && !SCHOOL_INVENTORY_URL.startsWith("PASTE_");
   return `
     <div class="tabs">
       <button class="btn btn-tab ${state.view === "home" ? "active" : ""}" data-action="set-view" data-view="home">🏠 Home</button>
       <button class="btn btn-tab ${state.view === "directory" ? "active" : ""}" data-action="set-view" data-view="directory">Directory</button>
       <button class="btn btn-tab ${state.view === "dashboard" ? "active" : ""}" data-action="set-view" data-view="dashboard">📊 Dashboard</button>
-      ${inventoryReady
-        ? `<a class="btn btn-tab" href="${esc(SCHOOL_INVENTORY_URL)}" target="_blank" rel="noopener">📦 Inventory</a>`
-        : `<button class="btn btn-tab" data-action="inventory-not-set-up">📦 Inventory</button>`}
+      <button class="btn btn-tab ${state.view === "inventory" ? "active" : ""}" data-action="set-view" data-view="inventory">📦 Inventory</button>
     </div>
   `;
 }
@@ -2187,6 +2287,65 @@ function todRemarkEditorHtml(id, currentRemark, editable) {
   `;
 }
 
+// ---------- Read-only Inventory page (reachable from a teacher's folder, or Admin) ----------
+function renderInventoryPage() {
+  const backView = state.session ? "folder" : "dashboard";
+  const activeSheet = state.inventoryActiveSheet || (INVENTORY_SHEETS[0] && INVENTORY_SHEETS[0].sheet);
+  const tab = getInventoryTabState(activeSheet);
+  const search = (state.inventorySearch || "").trim().toLowerCase();
+  const filteredRows = tab.data && search
+    ? tab.data.rows.filter((r) => r.some((cell) => String(cell || "").toLowerCase().includes(search)))
+    : (tab.data ? tab.data.rows : []);
+  const sheetReady = SCHOOL_INVENTORY_URL && !SCHOOL_INVENTORY_URL.startsWith("PASTE_");
+  const editUrl = inventoryEditUrl();
+
+  return `
+    <button class="btn btn-plain" data-action="set-view" data-view="${backView}">⬅ Back</button>
+    <div class="section-head">
+      <h2 class="serif" style="font-size:20px; margin:0; color:#4A3B22;">📦 School Inventory</h2>
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="btn btn-tab btn-sm" data-action="refresh-inventory" data-sheet="${esc(activeSheet)}" ${tab.loading ? "disabled" : ""}>${tab.loading ? "Refreshing…" : "🔄 Refresh"}</button>
+        ${sheetReady
+          ? `<a class="btn btn-dark btn-sm" href="${esc(editUrl)}" target="_blank" rel="noopener">➕ Add / Edit Items</a>`
+          : `<button class="btn btn-dark btn-sm" data-action="inventory-not-set-up">➕ Add / Edit Items</button>`}
+      </div>
+    </div>
+    <div class="dash-sub" style="margin-top:-8px;">Tap "Add / Edit Items" to open the spreadsheet — click the "${esc(activeSheet)}" tab there to edit this section. Changes show up here next time you Refresh.</div>
+
+    ${INVENTORY_SHEETS.length > 1 ? `
+      <div class="tabs" style="margin-top:14px; margin-bottom:0; flex-wrap:wrap;">
+        ${INVENTORY_SHEETS.map((s) => `
+          <button class="btn btn-tab btn-sm ${s.sheet === activeSheet ? "active" : ""}" data-action="switch-inventory-tab" data-sheet="${esc(s.sheet)}">${esc(s.label)}</button>
+        `).join("")}
+      </div>
+    ` : ""}
+
+
+    ${tab.data && tab.data.rows.length > 0 ? `
+      <div class="directory-search" style="margin-top:14px;">
+        <input type="text" id="inventory-search-input" placeholder="🔍 Search inventory…" value="${esc(state.inventorySearch || "")}" />
+      </div>
+    ` : ""}
+
+    ${tab.loading && !tab.data ? `<div class="doc-empty">Loading inventory…</div>` : ""}
+    ${tab.error ? `<div class="error-banner">${esc(tab.error)}</div>` : ""}
+
+    ${tab.data && tab.data.rows.length > 0 ? `
+      <div class="dash-table-wrap" style="overflow-x:auto;">
+        <table>
+          <thead><tr>${tab.data.cols.map((c) => `<th>${esc(c || "")}</th>`).join("")}</tr></thead>
+          <tbody>
+            ${filteredRows.length === 0
+              ? `<tr><td colspan="${tab.data.cols.length}" style="text-align:center; color:var(--c-ink-300); padding:20px;">No items match "${esc(state.inventorySearch)}".</td></tr>`
+              : filteredRows.map((r) => `<tr>${tab.data.cols.map((_, i) => `<td>${esc(r[i] || "")}</td>`).join("")}</tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div style="font-size:11.5px; color:var(--c-ink-400); margin-top:10px; text-align:right;">${filteredRows.length} of ${tab.data.rows.length} item${tab.data.rows.length === 1 ? "" : "s"}</div>
+    ` : (tab.data && !tab.loading ? `<div class="doc-empty">This sheet is empty.</div>` : "")}
+  `;
+}
+
 
 function renderDashboard() {
   const data = state.data;
@@ -2565,6 +2724,11 @@ function renderTeacherServicesSection() {
         <span class="action-icon">📖</span>
         <span class="action-label">TOD Reports<br>&<br> Follow-ups</span>
         <span class="action-sub">View all reports &amp; follow-ups</span>
+      </button>
+      <button class="action-card" data-action="set-view" data-view="inventory">
+        <span class="action-icon">📦</span>
+        <span class="action-label">Inventory</span>
+        <span class="action-sub">View school inventory (view-only)</span>
       </button>
     </div>
   `;
@@ -3122,6 +3286,21 @@ document.addEventListener("DOMContentLoaded", () => {
       state.view = el.dataset.view;
       render();
       if (state.view === "home") animateStatCounters();
+      if (state.view === "inventory") {
+        if (!state.inventoryActiveSheet) {
+          state.inventoryActiveSheet = INVENTORY_SHEETS[0] && INVENTORY_SHEETS[0].sheet;
+        }
+        state.inventorySearch = "";
+        loadInventoryData(state.inventoryActiveSheet);
+      }
+      return;
+    }
+    if (action === "refresh-inventory") { await loadInventoryData(el.dataset.sheet || state.inventoryActiveSheet, true); return; }
+    if (action === "switch-inventory-tab") {
+      state.inventoryActiveSheet = el.dataset.sheet;
+      state.inventorySearch = "";
+      render();
+      await loadInventoryData(el.dataset.sheet);
       return;
     }
     if (action === "open-add-teacher") { state.modal = { type: "addTeacher" }; return render(); }
@@ -3701,6 +3880,10 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     if (e.target.id === "directory-search-input") {
       state.directorySearch = e.target.value;
+      render();
+    }
+    if (e.target.id === "inventory-search-input") {
+      state.inventorySearch = e.target.value;
       render();
     }
   });
